@@ -9,15 +9,16 @@ gst-launch-1.0 filesrc location=/proj/tappas/swCenterDW/tappas_v3.29.1/apps/h8/g
 
 ```
 
-## 
+## run
 
+* single with gui:
 
 ```
 # Default camera detection
 python detection.py
 
 # Different camera and resolution
-python detection.py --device /dev/video0 --width 1280 --height 720 --input-fps 60
+python detection.py --device /dev/video0 --width 1280 --height 720 --input-fps 120 --inference-fps 30
 
 # Use a file instead of camera
 python  detection.py --input /path/to/video.mp4
@@ -26,3 +27,11 @@ python  detection.py --input /path/to/video.mp4
 python  detection.py --print
 
 ```
+
+* store to files:
+
+```
+python detection_files.py --device /dev/video0 --width 1280 --height 720 --input-fps 120 --inference-fps 30 --segment-seconds 2 --max-files 4 --output-dir ./fly1 --prefix flyX
+
+```
+

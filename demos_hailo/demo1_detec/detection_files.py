@@ -6,7 +6,7 @@ import gi
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GObject", "2.0")
-from gi.repository import Gst, GObject
+from gi.repository import Gst, GLib
 
 Gst.init(None)
 
@@ -15,7 +15,7 @@ def build_detection_pipeline(
     device="/dev/video0",
     width=640,
     height=480,
-    input_fps=30,
+    input_fps=60,
     inference_fps=15,
     hef_path="./yolov8m.hef",
     post_so="./libyolo_hailortpp_post.so",
@@ -23,15 +23,27 @@ def build_detection_pipeline(
     batch_size=1,
     nms_score_threshold=0.3,
     nms_iou_threshold=0.45,
-    video_sink="xvimagesink",
-    input_source=None,          # if provided, can be file OR /dev/videoX
-    tcp_host=None,
-    tcp_port=None,
+    input_source=None,          # file OR /dev/videoX OR None (default camera)
+    segment_seconds=5.0,
+    max_files=0,
+    output_dir="./recordings",
+    file_prefix="detRec_",
+    bitrate_kbps=4000,
 ):
     """
-    Build a GStreamer pipeline string for Hailo detection.
-    Supports separate input FPS (camera) and inference FPS (via videorate).
+    Build a GStreamer pipeline string for Hailo detection, writing
+    overlaid output to segmented MP4 files (no display).
+
+      source -> fps control -> hailonet -> hailofilter -> hailooverlay
+            -> x264enc -> h264parse -> splitmuxsink
     """
+
+    # Ensure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+
+    # File pattern for splitmuxsink, e.g. ./fly1/flyX00001.mp4
+    file_pattern = os.path.join(output_dir, f"{file_prefix}%05d.mp4")
+    segment_ns = int(segment_seconds * 1_000_000_000)
 
     # ---- Source element (camera vs file) ----
     if input_source:
@@ -39,49 +51,41 @@ def build_detection_pipeline(
         if is_camera:
             source_element = f"v4l2src device={input_source} name=src_0 ! videoflip video-direction=horiz"
         else:
-            # file source
             source_element = f"filesrc location={input_source} name=src_0 ! decodebin"
     else:
-        # Default: raw camera like pose script
         is_camera = True
         input_source = device
         source_element = f"v4l2src device={device} name=src_0 ! videoflip video-direction=horiz"
 
     # ---- FPS control (input vs inference) ----
     if is_camera:
-        # For camera: set sensor caps to input_fps, then downsample to inference_fps
+        # Set camera caps to input_fps, then drop frames to inference_fps
         fps_block = (
             f" ! video/x-raw,format=UYVY,width={width},height={height},framerate={input_fps}/1 "
             f"! videorate drop-only=true ! video/x-raw,framerate={inference_fps}/1"
         )
     else:
-        # For files: just enforce inference_fps using videorate
+        # For files, just enforce inference_fps
         fps_block = (
             f" ! videorate drop-only=true ! video/x-raw,framerate={inference_fps}/1"
         )
-
-    # ---- Sink element (screen or TCP) ----
-    if tcp_host and tcp_port:
-        sink_element = f"""
-            queue name=queue_before_sink leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0 !
-            videoscale !
-            video/x-raw,width=836,height=546,format=RGB !
-            tcpclientsink host={tcp_host} port={tcp_port}
-        """
-    else:
-        sink_element = f"""
-            fpsdisplaysink name=hailo_display
-                video-sink={video_sink}
-                text-overlay=false
-                sync=false
-                signal-fps-measurements=true
-        """
 
     thresholds_str = (
         f"nms-score-threshold={nms_score_threshold} "
         f"nms-iou-threshold={nms_iou_threshold} "
         f"output-format-type=HAILO_FORMAT_TYPE_FLOAT32"
     )
+
+    # ---- Recording sink (encode + mux + segment) ----
+    sink_element = f"""
+        x264enc tune=zerolatency speed-preset=ultrafast bitrate={bitrate_kbps} key-int-max={inference_fps} !
+        h264parse !
+        splitmuxsink name=record_sink
+            location={file_pattern}
+            max-size-time={segment_ns}
+            max-files={max_files}
+            muxer-factory=mp4mux
+    """
 
     pipe = f"""
         {source_element}
@@ -105,15 +109,6 @@ def build_detection_pipeline(
     return " ".join(pipe.split())
 
 
-# -------- FPS callbacks --------
-def on_fps_measurements(fpssink, fps, droprate, avg_fps):
-    print(f"[FPS] inst: {fps:.2f}  drop: {droprate:.2f}  avg: {avg_fps:.2f}")
-
-
-def on_fps_measurement(fpssink, fps):
-    print(f"[FPS] inst: {fps:.2f}")
-
-
 def run_pipeline(args):
     pipeline_str = build_detection_pipeline(
         device=args.device,
@@ -127,35 +122,33 @@ def run_pipeline(args):
         batch_size=args.batch_size,
         nms_score_threshold=args.nms_score,
         nms_iou_threshold=args.nms_iou,
-        video_sink=args.sink,
         input_source=args.input,
-        tcp_host=args.tcp_host,
-        tcp_port=args.tcp_port,
+        segment_seconds=args.segment_seconds,
+        max_files=args.max_files,
+        output_dir=args.output_dir,
+        file_prefix=args.prefix,
+        bitrate_kbps=args.bitrate,
     )
 
     if args.print:
-        print("=== DETECTION PIPELINE ===")
+        print("=== DETECTION PIPELINE (RECORDING) ===")
         print(pipeline_str)
         return 0
 
+    print("=== CONFIG ===")
+    print(f"Device:          {args.device}")
+    print(f"Size:            {args.width}x{args.height}")
+    print(f"Input FPS:       {args.input_fps}")
+    print(f"Inference FPS:   {args.inference_fps}")
+    print(f"Segment seconds: {args.segment_seconds}")
+    print(f"Max files:       {args.max_files}")
+    print(f"Output dir:      {args.output_dir}")
+    print(f"Prefix:          {args.prefix}")
+    print("================\n")
+
     pipeline = Gst.parse_launch(pipeline_str)
 
-    # Connect FPS signals (when using fpsdisplaysink)
-    fpssink = pipeline.get_by_name("hailo_display")
-    if fpssink:
-        try:
-            fpssink.connect("fps-measurements", on_fps_measurements)
-        except TypeError:
-            pass
-        try:
-            fpssink.connect("fps-measurement", on_fps_measurement)
-        except TypeError:
-            pass
-    else:
-        if not (args.tcp_host and args.tcp_port):
-            print("Warning: fpsdisplaysink 'hailo_display' not found; no FPS output.", file=sys.stderr)
-
-    # Bus handling
+    # For debug: connect to splitmuxsink element messages (segment open/close)
     bus = pipeline.get_bus()
     bus.add_signal_watch()
 
@@ -163,32 +156,65 @@ def run_pipeline(args):
         t = message.type
         if t == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
-            print(f"ERROR: {err}", file=sys.stderr)
+            print(f"[ERROR] {err}", file=sys.stderr)
             if debug:
-                print(f"DEBUG: {debug}", file=sys.stderr)
+                print(f"[DEBUG] {debug}", file=sys.stderr)
             loop.quit()
         elif t == Gst.MessageType.EOS:
-            print("EOS reached")
+            print("[INFO] EOS reached, stopping main loop.")
             loop.quit()
+        elif t == Gst.MessageType.ELEMENT:
+            s = message.get_structure()
+            if not s:
+                return
+            name = s.get_name()
+            if name == "splitmuxsink-fragment-opened":
+                loc = s.get_string("location")
+                idx_ok, idx = s.get_uint("fragment-id")
+                if not idx_ok:
+                    idx = -1
+                print(f"[record] Opened segment #{idx}: {loc}")
+            elif name == "splitmuxsink-fragment-closed":
+                loc = s.get_string("location")
+                idx_ok, idx = s.get_uint("fragment-id")
+                if not idx_ok:
+                    idx = -1
+                print(f"[record] Closed segment #{idx}: {loc}")
 
     bus.connect("message", on_message)
 
+    # Auto-stop logic: after N segments worth of time, send EOS
+    # total_duration = segment_seconds * max_files (+ small safety margin)
+    if args.max_files > 0 and args.segment_seconds > 0:
+        total_ms = int(args.segment_seconds * args.max_files * 1000) + 1000
+
+        def send_eos():
+            print(f"[INFO] Reached planned total duration (~{args.segment_seconds * args.max_files:.1f}s). Sending EOS...")
+            pipeline.send_event(Gst.Event.new_eos())
+            return False  # do not reschedule
+
+        GLib.timeout_add(total_ms, send_eos)
+        print(f"[INFO] Will auto-send EOS after ~{args.segment_seconds * args.max_files:.1f}s.")
+
     pipeline.set_state(Gst.State.PLAYING)
-    print("Detection pipeline running. Ctrl+C to stop.")
+    print("Detection recording pipeline running. Ctrl+C to stop early.\n")
 
     try:
         loop.run()
     except KeyboardInterrupt:
-        print("\nStopping pipeline...")
+        print("\n[INFO] KeyboardInterrupt received, sending EOS...")
+        pipeline.send_event(Gst.Event.new_eos())
+        # Let EOS message stop the loop
     finally:
+        print("[INFO] Setting pipeline to NULL.")
         pipeline.set_state(Gst.State.NULL)
+        print("[INFO] Pipeline stopped, exiting.")
 
     return 0
 
 
 if __name__ == "__main__":
-    GObject.threads_init()
-    loop = GObject.MainLoop()
+    loop = GLib.MainLoop()
 
     tappas_ws = os.environ.get("TAPPAS_WORKSPACE", "")
     if tappas_ws:
@@ -207,7 +233,7 @@ if __name__ == "__main__":
         default_hef = "./yolov8m.hef"
 
     parser = argparse.ArgumentParser(
-        description="Hailo Detection Pipeline (camera/file) with FPS control and FPS print"
+        description="Hailo Detection Pipeline (camera/file) recording to segmented MP4 files"
     )
 
     # Source / camera-style args
@@ -217,8 +243,8 @@ if __name__ == "__main__":
                         help="Camera width (default: 640)")
     parser.add_argument("--height", type=int, default=480,
                         help="Camera height (default: 480)")
-    parser.add_argument("--input-fps", type=int, default=30,
-                        help="Camera input FPS (default: 30)")
+    parser.add_argument("--input-fps", type=int, default=60,
+                        help="Camera input FPS (default: 60)")
     parser.add_argument("--inference-fps", type=int, default=15,
                         help="FPS after videorate for inference (default: 15)")
 
@@ -240,13 +266,18 @@ if __name__ == "__main__":
     parser.add_argument("--nms-iou", type=float, default=0.45,
                         help="NMS IoU threshold (default: 0.45)")
 
-    # Sink
-    parser.add_argument("--sink", default="xvimagesink",
-                        help="Video sink for local display (default: xvimagesink)")
-    parser.add_argument("--tcp-host", default=None,
-                        help="If set with --tcp-port, send frames to TCP host instead of local sink")
-    parser.add_argument("--tcp-port", type=int, default=None,
-                        help="TCP port for tcpclientsink (requires --tcp-host)")
+    # Recording parameters
+    parser.add_argument("--segment-seconds", type=float, default=5.0,
+                        help="Length of each output file in seconds (default: 5.0)")
+    parser.add_argument("--max-files", type=int, default=0,
+                        help="Maximum number of files to keep and total segments to run "
+                             "(0 = unlimited, no auto-stop; default: 0)")
+    parser.add_argument("--output-dir", default="./recordings",
+                        help="Directory to store output files (default: ./recordings)")
+    parser.add_argument("--prefix", default="detRec_",
+                        help="File name prefix (default: detRec_)")
+    parser.add_argument("--bitrate", type=int, default=4000,
+                        help="H.264 encoder bitrate in kbps (default: 4000)")
 
     # Utility
     parser.add_argument("--print", action="store_true",
