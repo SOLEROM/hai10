@@ -1,0 +1,196 @@
+Here is the clear explanation of **how `hailomuxer` works** and **how you use it to combine VIDEO + Hailo METADATA streams**.
+This is one of the least-documented but most important concepts in TAPPAS pipelines.
+
+---
+
+# ✅ What `hailomuxer` actually does
+
+`hailomuxer` is a special GStreamer element created by Hailo.
+
+Its purpose:
+
+### **👉 Combine multiple input branches (video + metadata) into ONE synchronized output stream.**
+
+In other words:
+
+```
+VIDEO FRAME → (branch 1)
+NN METADATA → (branch 2)
+tracker output → (branch 3)
+-----------------------------------------------------
+hailomuxer → single GstBuffer containing both data
+```
+
+This is internally similar to a “join” or “synchronizing muxer”:
+
+* **Video buffer**: real pixels
+* **Metadata buffers**: tensors, detections, tracker info
+
+`hailomuxer` attaches metadata from all branches onto the main video buffer and sends **a single buffer downstream**.
+
+Downstream elements then use **hailo metadata API** to read all info inside the buffer.
+
+---
+
+# Why do we need `hailomuxer`?
+
+Because each Hailo plugin (`hailonet`, `hailofilter`, `hailotracker`, etc.) produces metadata **on its own internal stream**.
+
+But video is in a completely separate branch.
+
+Without muxing:
+
+* Video goes one way.
+* Post-processing metadata goes another.
+* They never meet → you cannot overlay or track properly.
+
+`hailomuxer` ensures:
+
+### **1 video frame = 1 combined packet containing:**
+
+* video frame
+* inference results
+* post-processing results
+* tracker ID metadata
+* any additional metadata other branches attach
+
+---
+
+# How to use `hailomuxer` (minimum example)
+
+### **Pipeline structure:**
+
+```
+CAMERA (video stream)
+      |
+      v
+  [hmux.video]
+      |
+      |------ video → overlay → display
+
+NN postproc output (metadata stream)
+      |
+      v
+  [hmux.metadata]
+```
+
+### **GStreamer pipeline example:**
+
+```bash
+gst-launch-1.0 \
+    v4l2src ! video/x-raw,format=RGB ! queue ! hmux.video \
+    hailonet hef-path=model.hef ! hailofilter ! hailotracker ! queue ! hmux.metadata \
+    hmux. ! hailooverlay ! autovideosink
+```
+
+Breakdown:
+
+### **Branch 1 (video):**
+
+```
+v4l2src → RGB → hmux.video
+```
+
+### **Branch 2 (inference metadata):**
+
+```
+hailonet → hailofilter → hailotracker → hmux.metadata
+```
+
+### **After muxing:**
+
+```
+hmux. → hailooverlay → sink
+```
+
+Everything from the right side (metadata) is attached to video buffers arriving on the left side.
+
+---
+
+# Pads on `hailomuxer`
+
+`hailomuxer` has:
+
+* **sink pad “video”** → receives raw video frames
+* **sink pad “metadata”** → receives metadata buffers
+* **src pad** → outputs unified buffers
+
+You can inspect via:
+
+```bash
+gst-inspect-1.0 hailomuxer
+```
+
+---
+
+# What the output contains (important!)
+
+After muxing, **each buffer** has:
+
+### 📦 Attached metadata types:
+
+* HailoROIPrediction
+* HailoDetection
+* HailoPoseData
+* HailoTrackedObject
+* HailoClassification
+* Any metadata created by your `.so` postprocessor
+
+### And the actual raw video frame.
+
+Downstream (like `hailooverlay` or your app via a probe) reads these via:
+
+```c
+HailoROIPrediction *roi = hailo_get_roi_prediction(buffer);
+```
+
+Or in Python:
+
+```python
+roi = hailo.get_roi_prediction(buffer)
+```
+
+Without `hailomuxer`, downstream elements would **not** know how to connect metadata to video.
+
+---
+
+# Why hailooverlay requires a muxer
+
+`hailooverlay` expects:
+
+* one input buffer that includes **both video pixels + metadata attached**
+
+It does *not* fetch metadata from another pad.
+
+Therefore, if you skip `hailomuxer`, overlay will draw nothing or crash.
+
+---
+
+# Real world use cases for hailomuxer
+
+### ✔️ Multi-branch processing
+
+E.g., you have:
+
+* one branch for video
+* one for neural network
+* one for optical flow
+* one for tracking
+* one for additional custom metadata (your own plugin)
+
+`hailomuxer` merges all of them.
+
+### ✔️ Recording metadata + video together
+
+Use `hmux.` to write a single MP4 + JSON metadata stream.
+
+### ✔️ Sending combined stream over RTP or WebRTC
+
+Metadata travels embedded inside each frame.
+
+### ✔️ Multiple models
+
+YOLO branch + Pose branch → both metadata fused into video.
+
+---
+
