@@ -2,6 +2,8 @@
 
 ## python manager
 
+* use raw video input
+
 ```
 python3 pose_pipeline.py            //Run defaults
 
